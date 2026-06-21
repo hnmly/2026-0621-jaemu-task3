@@ -290,3 +290,135 @@ cd terraform && terraform apply -auto-approve
 
 > 요약: **perf% 낮은 그 앱 하나만** 골라 → `cpu↑` 또는 `HPA util↓/min↑` → 비용(`nodes avg`)과
 > 균형 맞추고 → `k8s_apps.tf`에 박아서 `apply`. 가용성 99%는 무조건 사수.
+
+---
+
+## WAF 차단 분석 — `waf_header_stats.py`
+
+대회 트래픽엔 **공격(비정상) 요청**이 섞여 들어온다. 그게 WAF에서 제대로 막히고 있는지,
+**아직 안 막힌 게 뭔지**를 WAF 로그로 보여주는 도구. (WAF는 CloudFront에 붙어 있어 **로그는 us-east-1**)
+
+### 한 줄 요약
+> 이 스크립트를 돌리면 **"지금 막아야 할 것"** 이 맨 위에 딱 나온다. 거기 뭔가 있으면 → 그 패턴을
+> `terraform/waf.tf`에 룰로 추가하고 `apply` → 다시 돌려서 그 칸이 빌 때까지 반복.
+
+### 1. 실행
+```bash
+pip install boto3        # 최초 1회만
+python3 waf_header_stats.py --log-group aws-waf-logs-wsi2026e --region us-east-1 --hours 1
+```
+- `<project>`가 `wsi2026e`면 로그그룹은 `aws-waf-logs-wsi2026e`.
+- ⚠ **`--hours 1` 로 보라.** `--hours 24`는 *룰을 적용하기 전* 옛날 기록까지 섞여서, 이미 고친 것도
+  "안 막혔다"고 보일 수 있다. 지금 상태를 보려면 짧게.
+- Windows면 `python3` 대신 `python`.
+
+### 2. 출력은 3덩어리
+
+**① WAF action 요약** — 전체가 얼마나 통과(ALLOW)/차단(BLOCK)됐나.
+```
+=== WAF action 요약 ===
+  ALLOW    410210
+  BLOCK    31146
+```
+
+**② ⚠ 아직 안 막힌 비정상 요청** ← **여기가 제일 중요.**
+"막아야 할(403) 요청인데 WAF가 통과시킨 것"만 모아준다. **비어 있으면 다 잘 막고 있는 것.**
+```
+=== ⚠ 아직 안 막힌 비정상 요청 (막아야 할 것) ===
+판정       WAF    status  cnt  endpoint  header           value
+403-XFF  ALLOW  -       4    /v1/user  X-Forwarded-For  127.0.0.1, 10.0.0.1
+```
+> 위처럼 cnt가 3~4로 작으면 보통 **룰 적용 전 잔재**다. `--hours 1`로 다시 보면 사라진다.
+
+**③ 전체 표** — 모든 (헤더 × 경로 × WAF처리 × 건수). `판정` 컬럼이 핵심.
+
+### 3. `판정` 컬럼 읽는 법
+
+| 판정 | 무슨 요청 | 어떻게 돼야 정상 |
+|---|---|---|
+| `OK` | 정상 트래픽 (Host=cloudfront, gzip, UA=hey/Go/curl, json, /images/*) | 통과 |
+| `404` | **없는 경로** (`/.env` `/admin` `/v1/users` `/v2/user` `/v1/none`) | **404** (차단 아님!) |
+| `403-UA` | 악성 User-Agent (sqlmap 등 스캐너, attack) | **403 차단** |
+| `403-XFF` | X-Forwarded-For 위조 (127.0.0.1 같은 가짜 IP) | **403 차단** |
+| `403-HDR` | 비정상 헤더 (X-Junk 같은 쓰레기 헤더) | **403 차단** |
+
+핵심 규칙 2개:
+- **없는 경로(/.env 등)는 막는 게 아니라 404** 다. (스펙: "제공 API 외 = 404")
+- **있는 경로(/v1/user 등)로 들어온 이상한 요청은 403** 으로 막는다.
+
+### 4. ⚠ 헷갈리기 쉬운 것 2가지 (꼭 읽기)
+
+**(가) `OK` 인데 `BLOCK` 인 행 = 오차단 아님.**
+통계가 *헤더 하나하나* 기준이라, 어떤 요청이 X-Junk 때문에 막히면 **그 요청에 같이 들어있던
+정상 헤더(Host·UA 등)까지 BLOCK으로 세어진다.**
+```
+OK  BLOCK  6137  /v1/user  Host  d35...cloudfront.net
+```
+이건 "정상 Host가 막혔다"가 아니라 **"다른 헤더 때문에 막힌 요청이 6137건 있다"** 는 뜻. 정상이다.
+
+**(나) 진짜 오차단(정상이 막힘)은 이 표 말고 대시보드로 본다.**
+대시보드 `avail%`가 100%면 정상 트래픽은 안 막히는 것. 떨어지면 그때 오차단 의심.
+
+### 5. 대회 당일 — 새 공격 찾기 (패턴이 바뀐다)
+
+`판정` 컬럼은 **아는 패턴만** 잡는다(sqlmap, X-Junk…). 대회날은 *처음 보는* 공격이 와서 `OK`로
+보일 수 있다. 그래서 전체 표에서 **`ALLOW`인데 수상한 행**을 눈으로 찾는다:
+- **User-Agent**가 이상한 값 (빈 값, 모르는 도구 이름, `attack` 류)
+- **처음 보는 헤더** (`X-무엇무엇`), **비정상적으로 긴 값**
+- **X-Forwarded-For**에 `127.0.0.1`·`10.x`·`192.168.x` 같은 내부/가짜 IP
+- 같은 `/v1/user`인데 정상(hey/Go/json)과 **다른 특징**을 가진 것
+
+### 6. 막는 법 — 패턴 종류별 룰 (terraform/waf.tf 에 추가)
+
+`terraform/waf.tf`의 `aws_wafv2_web_acl.cloudfront` 안에 **rule 블록**을 추가한다 (priority는 안 쓰는 번호).
+
+```hcl
+# (가) 악성 User-Agent — 이미 있는 BadUserAgent 의 regex 에 단어만 추가해도 됨
+#      regex_string = "(sqlmap|nikto|nmap|masscan|attack|wpscan|dirbuster|<새단어>)"
+
+# (나) 특정 헤더가 "있기만 하면" 차단 (예: X-Evil)
+rule {
+  name = "BlockXEvil"  priority = 6
+  action { block {} }
+  statement { size_constraint_statement {
+    comparison_operator = "GT"  size = 0
+    field_to_match { single_header { name = "x-evil" } }   # 헤더 이름은 소문자
+    text_transformation { priority = 0  type = "NONE" }
+  }}
+  visibility_config { cloudwatch_metrics_enabled = true  metric_name = "x-evil"  sampled_requests_enabled = true }
+}
+
+# (다) 특정 헤더 "값"에 문자열이 들어가면 차단 (예: Referer 에 evil.com)
+rule {
+  name = "BlockBadReferer"  priority = 7
+  action { block {} }
+  statement { byte_match_statement {
+    search_string = "evil.com"  positional_constraint = "CONTAINS"
+    field_to_match { single_header { name = "referer" } }
+    text_transformation { priority = 0  type = "LOWERCASE" }
+  }}
+  visibility_config { cloudwatch_metrics_enabled = true  metric_name = "bad-referer"  sampled_requests_enabled = true }
+}
+```
+> 더 많은 예(쿼리 인자 형식 검사 등)는 이미 적용된 `waf.tf`의 BadUserAgent/SpoofedForwardedFor/
+> OversizedJunkHeader 룰을 복사해서 헤더 이름·검색어만 바꾸면 된다.
+
+### 7. 적용하고 확인
+
+```powershell
+# 룰 추가 후 적용 (Windows, Docker 켜져 있어야 함)
+cd C:\Users\competitor\2026-terraform\3과제\terraform
+terraform apply -auto-approve -var is_windows=true
+```
+```bash
+# 그 공격 흉내로 직접 호출 → 403 떠야 막힌 것
+EP=http://d35rfootcsla2a.cloudfront.net
+curl -s -o /dev/null -w "%{http_code}\n" -H "X-Evil: 1" "$EP/v1/user?email=x@x.org&requestid=1&uuid=1"   # 403
+# 없는 경로는 여전히 404 인지도 확인
+curl -s -o /dev/null -w "%{http_code}\n" "$EP/.env"        # 404
+
+# 다시 통계 — '아직 안 막힌' 칸이 빌 때까지 반복
+python3 waf_header_stats.py --log-group aws-waf-logs-wsi2026e --region us-east-1 --hours 1
+```
+
+> 정상 트래픽이 같이 막히면 안 된다 → **대시보드 avail% 100% 유지** 확인하면서 조이기.

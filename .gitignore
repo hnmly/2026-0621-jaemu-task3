@@ -4,6 +4,11 @@
 *.tfstate.*
 .terraform.lock.hcl
 crash.log
+# python
+__pycache__/
+*.pyc
+# tuning outputs
+*.csv
 # os
 .DS_Store
 Thumbs.db

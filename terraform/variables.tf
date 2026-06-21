@@ -1,4 +1,4 @@
-﻿variable "region" {
+variable "region" {
   type    = string
   default = "ap-northeast-2"
 }
@@ -63,4 +63,10 @@ variable "aws_profile" {
   type        = string
   default     = ""
   description = "AWS named profile. Leave empty to use the default credential chain (env vars / default profile)."
+}
+
+variable "is_windows" {
+  type        = bool
+  default     = false
+  description = "Set true when running terraform from Windows PowerShell (no bash). build.tf then uses PowerShell instead of /bin/sh for the docker build/push step."
 }

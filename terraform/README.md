@@ -232,35 +232,58 @@ kubectl -n app logs job/db-init        # 시드 적재 로그
 
 ---
 
-## 대회 당일 — 앱을 새로 받았을 때 적용
+## 대회 당일 — 앱(바이너리)이 바뀌었을 때 적용
 
-대회 중 제공되는 **새 앱 바이너리**를 배포에 반영하는 절차.
+대회 중 **새 앱 바이너리**가 제공되면(또는 저장소가 갱신되면) 아래 순서로 반영합니다.
+배포에 실제로 쓰이는 건 소스(`.go`)가 아니라 **`application/binary/{user,product,stress}`** 입니다
+([build.tf](build.tf)가 이 바이너리만 ECR 이미지로 빌드·push). 그래서 **바이너리만 교체**하면 됩니다.
 
-### 1. 바이너리 교체
-받은 실행 파일을 아래 경로에 그대로 덮어씁니다 (파일명 고정: `user`, `product`, `stress`).
+### 1. 바이너리 교체 (파일명 고정: `user`, `product`, `stress`)
 
+**(A) jaemoohong 저장소에서 받는 경우** — 지금까지의 워크플로:
 ```bash
-cp /path/to/new/user    ~/wsi-2026-task3/application/binary/user
-cp /path/to/new/product ~/wsi-2026-task3/application/binary/product
-cp /path/to/new/stress  ~/wsi-2026-task3/application/binary/stress
-chmod +x ~/wsi-2026-task3/application/binary/{user,product,stress}
+git clone --depth 1 https://github.com/jaemoohong/user.git /tmp/userrepo
+cp /tmp/userrepo/user    <repo>/application/binary/user
+cp /tmp/userrepo/product <repo>/application/binary/product
+cp /tmp/userrepo/stress  <repo>/application/binary/stress
+```
+바뀐 것만 받으려면 해당 파일만 복사하면 됩니다. (예: user만 바뀌었으면 user만)
+
+**(B) 파일로 직접 받은 경우**:
+```bash
+cp /path/to/new/user    <repo>/application/binary/user   # product, stress 동일
 ```
 
-### 2. 새 태그로 apply (권장)
-이미지 태그를 새 값으로 바꿔 apply 하면, ECR push와 **Deployment 롤링 업데이트가 같이** 일어납니다.
-(기본 태그가 `latest`로 고정이면 매니페스트가 안 바뀌어 새 이미지가 롤아웃되지 않습니다.)
+> 실행권한 `chmod +x`는 **불필요**합니다 — [application/binary/Dockerfile](../application/binary/Dockerfile)이
+> `COPY --chmod=0755`로 이미지 안에서 권한을 부여합니다 (Windows에서도 OK).
 
+교체 확인(원본과 동일한지):
 ```bash
-cd ~/wsi-2026-task3/terraform
+sha256sum <repo>/application/binary/user /tmp/userrepo/user   # 두 해시가 같아야 함
+```
+
+### 2. 새 태그로 apply (반드시 태그 변경)
+이미지 태그를 **새 값으로** 바꿔 apply 해야 ECR push + Deployment 롤링 업데이트가 같이 일어납니다.
+태그가 `latest`로 고정이면 매니페스트가 안 바뀌어 **새 이미지가 롤아웃되지 않습니다.**
+
+PowerShell (Windows):
+```powershell
+cd <repo>\terraform
+terraform apply -auto-approve -var is_windows=true -var app_image_tag="v$([int](Get-Date -UFormat %s))"
+```
+bash (CloudShell):
+```bash
+cd <repo>/terraform
 terraform apply -auto-approve -var app_image_tag="v$(date +%s)"
 ```
 
 - 동작 흐름: 바이너리 hash 변경 → `null_resource.build_push` 재실행(빌드+push)
   → Deployment 이미지 태그 변경 → user/product/stress 파드 롤링 재배포.
+- ⚠️ Windows는 `-var is_windows=true` 필수(빌드를 PowerShell로 수행), **Docker Desktop 실행 중**이어야 함.
 
 ### 3. 롤아웃 확인
 ```bash
-aws eks update-kubeconfig --name wsi2026-cluster --region ap-northeast-2   # 최초 1회
+aws eks update-kubeconfig --name <project>-cluster --region ap-northeast-2   # 최초 1회 (예: wsi2026e-cluster)
 kubectl -n app rollout status deploy/user
 kubectl -n app rollout status deploy/product
 kubectl -n app rollout status deploy/stress
@@ -268,10 +291,17 @@ kubectl -n app get pods -o wide
 ```
 
 > 같은 태그(`latest`)로 빌드만 다시 한 경우엔 매니페스트가 동일해 자동 롤아웃이 안 됩니다.
-> 그럴 땐 강제로:
-> ```bash
-> kubectl -n app rollout restart deploy/user deploy/product deploy/stress
-> ```
+> 그럴 땐 강제로: `kubectl -n app rollout restart deploy/user deploy/product deploy/stress`
+
+### 4. 동작 검증 (교체 후 빠른 스모크 테스트)
+```bash
+EP=https://<cloudfront-domain>          # terraform output endpoint
+curl -s -o /dev/null -w "%{http_code}\n" $EP/healthcheck                      # 200
+curl -s "$EP/v1/product?id=dbdump1&requestid=1&uuid=1"                        # 200 또는 404(없으면)
+```
+> 엔드포인트(앱 동작)가 바뀌었을 수 있으니, 경로/메서드/필드가 [문제지 검증된 동작](#검증된-동작) 표와
+> 맞는지 확인. 앱 API 형식이 바뀌면 인프라가 아니라 **요청 형식**을 새 스펙에 맞춰야 합니다
+> (라우팅 경로가 `/v1/user|product|stress`에서 바뀌면 [alb.tf](alb.tf)의 `listener_rule` path도 수정).
 
 ---
 
@@ -366,6 +396,11 @@ GET  /random                            → 404
 > - 스키마명(`dev`) 변경 → **덤프의 `USE` 문**도 같이.
 > - 포트 변경 → Deployment·probe·Service·ALB TG **4곳** 모두.
 > - 엔드포인트 경로/응답코드 변경 → ALB·WAF·CloudFront 중 **해당 계층** 확인.
+
+---
+
+> **WAF 차단 대상 분석/대응**(`waf_header_stats.py`로 들어온 공격 보고 막는 법)은
+> [tuning/README.md](../tuning/README.md#waf-차단-분석--waf_header_statspy)에 정리.
 
 ---
 

@@ -30,6 +30,7 @@ resource "aws_cloudfront_distribution" "this" {
   comment         = "${local.name} single endpoint"
   http_version    = "http2and3"
   price_class     = "PriceClass_200"
+  web_acl_id      = aws_wafv2_web_acl.cloudfront.arn
 
   origin {
     domain_name              = aws_s3_bucket.images.bucket_regional_domain_name
@@ -40,6 +41,11 @@ resource "aws_cloudfront_distribution" "this" {
   origin {
     domain_name = aws_lb.this.dns_name
     origin_id   = "alb"
+    # Secret header so WAF can tell CloudFront traffic from direct ALB hits.
+    custom_header {
+      name  = "X-Origin-Verify"
+      value = random_password.origin_verify.result
+    }
     custom_origin_config {
       http_port                = 80
       https_port               = 443
