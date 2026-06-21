@@ -243,8 +243,13 @@ function wafxTest(f,ep){ep=ep||'http://<endpoint>';var q='/v1/user?email=x@x.org
 function wafxRun(){var text=document.getElementById('wafx_in').value;var ep=document.getElementById('wafx_ep').value.trim();
   var rows=wafxParse(text);
   if(!rows.length){document.getElementById('wafx_out').innerHTML='<div class=mut style="padding:10px">표 행을 못 읽었어요. waf_header_stats.py의 "전체" 표(또는 .csv)를 그대로 붙여넣어 주세요.</div>';return;}
+  // 같은 헤더/값이 이미 BLOCK 으로도 나오면 = 이미 막는 중 → ALLOW 잔재는 제외(룰 적용 전 옛 기록)
+  var blocked={};
+  rows.forEach(function(r){if(r.waf==='BLOCK'&&wafxValid(r.endpoint)){var hl=(r.header||'').toLowerCase();blocked[hl+'|'+(hl==='user-agent'?(r.value||'').toLowerCase():'')]=1;}});
   var seen={},finds=[];
-  rows.forEach(function(r){var f=wafxClassify(r);if(!f)return;var key=f.type+'|'+f.header+'|'+(f.type==='HDR'?'':f.value);if(seen[key])return;seen[key]=1;finds.push(f);});
+  rows.forEach(function(r){var f=wafxClassify(r);if(!f)return;
+    if(blocked[f.header+'|'+(f.type==='UA'?(f.value||'').toLowerCase():'')])return;  // 이미 막히는 중
+    var key=f.type+'|'+f.header+'|'+(f.type==='HDR'?'':f.value);if(seen[key])return;seen[key]=1;finds.push(f);});
   if(!finds.length){document.getElementById('wafx_out').innerHTML='<div class="tip good"><h3>막을 게 없습니다 👍</h3><div class=why>유효 경로로 들어온 비정상 요청 중 안 막힌 게 없어요. (없는 경로는 404가 정답이라 무시)</div></div>';return;}
   var prio=6;
   var out='<div class="tip warn"><h3>막아야 할 것 '+finds.length+'개</h3><div class=why>아래를 waf.tf에 반영하고 apply → 다시 분석.</div></div>';
