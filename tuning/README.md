@@ -449,6 +449,10 @@ python3 waf_header_stats.py --log-group aws-waf-logs-wsi2026e --region us-east-1
 ## 🎯 대회 당일 체크리스트 (감 없이 그대로 따라하기)
 
 > 헷갈리면 **여기만** 본다. 표의 **한 행씩** 아래 순서대로 기계적으로 처리.
+>
+> 🤖 **자동으로 하고 싶으면**: 모니터링 대시보드(`tools/dashboard.py`)의 **「WAF분석」 탭**에
+> `waf_header_stats.py` 출력을 **붙여넣고 [분석]** 하면 → 막을 것 + waf.tf 룰(복붙) + 테스트 명령을
+> 자동으로 뽑아준다. (AI 없이 오프라인 동작) 아래는 그 원리/수동 절차.
 
 ### STEP 0 — 돌리기
 ```bash

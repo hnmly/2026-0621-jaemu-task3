@@ -192,9 +192,80 @@ function vCalc(){
   +summary+'<div class="grid g3">'+cards+'</div>'
   +'<div class=mut style="margin-top:12px;font-size:12px">권장값을 k8s_apps.tf의 각 앱 requests.cpu / HPA averageUtilization / min_replicas 에 반영 후 apply. 노드 추정 = ⌈Σ(min×cpu)/1900m⌉ (t3.medium). 「줄여 ↓」=과투자(비용↓ 가능), 「늘려 ↑」=성능/가용성 부족.</div>';}
 
-function tabs(){var t=[['overview','개요']].concat(D.apps.map(function(a){return [a.app,a.app]})).concat([['pods','Pod'],['nodes','노드'],['waf','WAF'],['calc','계산'],['diag','진단']]);
+// ---- WAF분석 탭: waf_header_stats.py 출력 붙여넣기 → 막을 것 + 룰 + 테스트 ----
+var WAFX_VALID=['/v1/user','/v1/product','/v1/stress','/healthcheck','/images'];
+var WAFX_NORMHDR={'host':1,'accept-encoding':1,'content-type':1,'content-length':1,'accept':1,'user-agent':1,'connection':1,'via':1,'x-amz-cf-id':1,'upgrade-insecure-requests':1};
+var WAFX_GOODUA=['hey/','go-http-client','curl/','mozilla','chrome','safari','firefox','edg'];
+var WAFX_SCAN=['sqlmap','nikto','nmap','masscan','acunetix','havij','wpscan','dirbuster','nuclei','attack','gobuster','fuzz','scanner','zgrab','python-requests'];
+function wafxValid(ep){ep=(ep||'').split('?')[0].toLowerCase();for(var i=0;i<WAFX_VALID.length;i++){if(ep===WAFX_VALID[i]||ep.indexOf(WAFX_VALID[i]+'/')===0||(WAFX_VALID[i]==='/images'&&ep.indexOf('/images')===0))return true;}return false;}
+function wafxParse(text){var rows=[];text.split('\n').forEach(function(ln){
+  if(/,/.test(ln)&&/(ALLOW|BLOCK)/.test(ln)&&ln.indexOf('/')>=0&&!/^\s*판정|verdict/i.test(ln)){var c=ln.split(',');if(c.length>=6){rows.push({verdict:c[0].trim(),waf:c[1].trim().toUpperCase(),cnt:c[3]||'',endpoint:c[4]||'',header:(c[5]||'').trim(),value:c.slice(6).join(',').trim()});return;}}
+  var f=ln.trim().split(/\s{2,}/);
+  if(f.length>=6&&/^(ALLOW|BLOCK)$/i.test(f[1])){rows.push({verdict:f[0],waf:f[1].toUpperCase(),cnt:f[3],endpoint:f[4],header:f[5],value:f.slice(6).join(' ')});}
+});return rows;}
+function wafxClassify(r){ // 반환: null(정상/404) 또는 {type, header, value, why}
+  if(!wafxValid(r.endpoint))return null;            // 경로 없음 → 404, 막지 않음
+  if(r.waf==='BLOCK')return null;                   // 이미 막힘
+  var hl=(r.header||'').toLowerCase(), val=r.value||'';
+  if((r.verdict||'').indexOf('403')===0){           // 스크립트가 이미 403대상으로 판정
+    if(/uagent|ua/i.test(r.verdict)||hl==='user-agent')return {type:'UA',header:'user-agent',value:val,why:'악성 User-Agent'};
+    if(/xff/i.test(r.verdict)||hl==='x-forwarded-for')return {type:'XFF',header:'x-forwarded-for',value:val,why:'X-Forwarded-For 위조'};
+    return {type:'HDR',header:hl,value:val,why:'비정상 헤더'};
+  }
+  // 판정이 OK여도(=새 공격) 의심 행 잡기
+  if(hl==='user-agent'){var lv=val.toLowerCase();
+    if(WAFX_SCAN.some(function(s){return lv.indexOf(s)>=0}))return {type:'UA',header:'user-agent',value:val,why:'스캐너/도구 UA'};
+    if(WAFX_GOODUA.some(function(g){return lv.indexOf(g)>=0}))return null; // 정상 브라우저/도구
+    if(lv.trim()==='')return {type:'UA',header:'user-agent',value:val,why:'빈 User-Agent'};
+    return null; // 모르는 UA는 섣불리 안 막음(오차단 방지)
+  }
+  if(hl==='x-forwarded-for'&&/(^|[ ,])(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(val))return {type:'XFF',header:'x-forwarded-for',value:val,why:'내부/루프백 IP 삽입'};
+  if(!WAFX_NORMHDR[hl])return {type:'HDR',header:hl,value:val,why:'처음 보는 헤더'}; // 화이트리스트 외 헤더
+  return null;
+}
+function wafxRule(f,prio){var nm,hcl;
+  if(f.type==='UA'){var tok=(f.value||'').toLowerCase().replace(/[^a-z0-9].*$/,'')||'badtool';
+    return {title:'악성 UA: '+esc(f.value),note:'기존 BadUserAgent 룰의 regex_string 에 단어 추가:',hcl:'regex_string = "(sqlmap|nikto|nmap|masscan|attack|nuclei|'+tok+')"'};}
+  if(f.type==='XFF'){return {title:'XFF 위조: '+esc(f.value),note:'기존 SpoofedForwardedFor 의 statement 를 이 regex 로 교체(내부/사설 IP 전부):',
+    hcl:'statement { regex_match_statement {\n  regex_string = "(127\\\\.0\\\\.0\\\\.1|10\\\\.|192\\\\.168\\\\.|172\\\\.(1[6-9]|2[0-9]|3[01])\\\\.)"\n  field_to_match { single_header { name = "x-forwarded-for" } }\n  text_transformation { priority = 0  type = "NONE" }\n}}'};}
+  // HDR: 헤더 존재 시 차단
+  var safe=f.header.replace(/[^a-z0-9-]/g,'');
+  return {title:'비정상 헤더: '+esc(f.header),note:'그 헤더가 있으면 차단 (waf.tf 의 aws_wafv2_web_acl.cloudfront 안에 rule 추가):',
+    hcl:'rule {\n  name = "BlockHeader_'+safe+'"  priority = '+prio+'\n  action { block {} }\n  statement { size_constraint_statement {\n    comparison_operator = "GT"  size = 0\n    field_to_match { single_header { name = "'+f.header+'" } }\n    text_transformation { priority = 0  type = "NONE" }\n  }}\n  visibility_config { cloudwatch_metrics_enabled = true  metric_name = "'+safe+'"  sampled_requests_enabled = true }\n}'};}
+function wafxTest(f,ep){ep=ep||'http://<endpoint>';var q='/v1/user?email=x@x.org&requestid=1&uuid=7c5a3c6a-758f-4bc5-9bdf-3e573a0ad729';
+  if(f.type==='UA')return 'curl -s -o /dev/null -w "%{http_code}\\n" -H "User-Agent: '+f.value+'" "'+ep+q+'"   # 403';
+  if(f.type==='XFF')return 'curl -s -o /dev/null -w "%{http_code}\\n" -H "X-Forwarded-For: 10.0.0.1" "'+ep+q+'"   # 403';
+  return 'curl -s -o /dev/null -w "%{http_code}\\n" -H "'+f.header+': 1" "'+ep+q+'"   # 403';}
+function wafxRun(){var text=document.getElementById('wafx_in').value;var ep=document.getElementById('wafx_ep').value.trim();
+  var rows=wafxParse(text);
+  if(!rows.length){document.getElementById('wafx_out').innerHTML='<div class=mut style="padding:10px">표 행을 못 읽었어요. waf_header_stats.py의 "전체" 표(또는 .csv)를 그대로 붙여넣어 주세요.</div>';return;}
+  var seen={},finds=[];
+  rows.forEach(function(r){var f=wafxClassify(r);if(!f)return;var key=f.type+'|'+f.header+'|'+(f.type==='HDR'?'':f.value);if(seen[key])return;seen[key]=1;finds.push(f);});
+  if(!finds.length){document.getElementById('wafx_out').innerHTML='<div class="tip good"><h3>막을 게 없습니다 👍</h3><div class=why>유효 경로로 들어온 비정상 요청 중 안 막힌 게 없어요. (없는 경로는 404가 정답이라 무시)</div></div>';return;}
+  var prio=6;
+  var out='<div class="tip warn"><h3>막아야 할 것 '+finds.length+'개</h3><div class=why>아래를 waf.tf에 반영하고 apply → 다시 분석.</div></div>';
+  finds.forEach(function(f){var ru=wafxRule(f,prio++);
+    out+='<div class=card style="margin-bottom:12px"><div class=lbl>'+esc(f.why)+'</div>'
+      +'<div style="font-size:12.5px;margin-bottom:7px">'+ru.title+'</div>'
+      +'<div class=mut style="font-size:12px;margin-bottom:4px">① 룰 — '+ru.note+'</div>'
+      +'<pre style="margin:0 0 9px;background:#f6f7f9;border:1px solid var(--line);border-radius:8px;padding:9px 11px;font-size:11.5px;white-space:pre-wrap;color:#1a1d23;overflow-x:auto">'+esc(ru.hcl)+'</pre>'
+      +'<div class=mut style="font-size:12px;margin-bottom:4px">② 적용 후 테스트 (403 떠야 함)</div>'
+      +'<pre style="margin:0;background:#f6f7f9;border:1px solid var(--line);border-radius:8px;padding:9px 11px;font-size:11.5px;white-space:pre-wrap;color:#1a1d23;overflow-x:auto">'+esc(wafxTest(f,ep))+'</pre></div>';});
+  out+='<div class="tip dim"><h3>적용 순서</h3><div class=why>1) 위 룰들을 terraform/waf.tf 에 추가 (priority는 안 쓰는 번호)\n2) cd terraform && terraform apply -auto-approve -var is_windows=true\n3) 위 curl 로 403 확인, 없는 경로는 404 확인\n4) waf_header_stats.py 다시 돌려 붙여넣고 「막을 게 없습니다」 나올 때까지 반복\n5) 대시보드 avail% 100% 유지(정상 오차단 없는지)</div></div>';
+  document.getElementById('wafx_out').innerHTML=out;}
+function vWafAnalyze(){
+  return '<div class=card><h2>WAF분석 — 공격 로그 붙여넣고 막을 것 받기</h2>'
+   +'<div class=mut style="font-size:12px;margin-bottom:9px">CloudShell에서 <code>python3 waf_header_stats.py --log-group aws-waf-logs-&lt;project&gt; --region us-east-1 --hours 1</code> 돌린 <b>"전체" 표 출력</b>(또는 .csv)을 통째로 붙여넣고 [분석].</div>'
+   +'<div style="margin-bottom:8px">엔드포인트(테스트 명령용): <input id=wafx_ep type=text placeholder="http://xxxx.cloudfront.net" style="width:320px;background:var(--card2);color:var(--txt);border:1px solid var(--line);border-radius:7px;padding:6px 9px"></div>'
+   +'<textarea id=wafx_in placeholder="여기에 waf_header_stats.py 출력 붙여넣기..." style="width:100%;height:200px;background:#f6f7f9;color:#1a1d23;border:1px solid var(--line);border-radius:8px;padding:10px;font-size:12px;font-family:monospace"></textarea>'
+   +'<button onclick="wafxRun()" style="margin-top:10px">분석</button>'
+   +'<div id=wafx_out style="margin-top:15px"></div></div>';}
+
+function tabs(){var t=[['overview','개요']].concat(D.apps.map(function(a){return [a.app,a.app]})).concat([['pods','Pod'],['nodes','노드'],['waf','WAF'],['wafx','WAF분석'],['calc','계산'],['diag','진단']]);
  document.getElementById('tabs').innerHTML=t.map(function(x){return '<div class="tab'+(x[0]===TAB?' on':'')+'" onclick="setTab(\''+x[0]+'\')">'+x[1]+'</div>'}).join('')}
 function render(){if(!D)return;var v=document.getElementById('view');
+ // WAF분석 탭은 한 번 만들면 유지 (자동 갱신이 붙여넣은 내용을 지우지 않게)
+ if(TAB==='wafx'){if(!document.getElementById('wafx_in'))v.innerHTML=vWafAnalyze();return;}
  // 자동 갱신 시 열어둔 상세 패널을 유지 (새 항목은 위에 쌓이고, 보던 건 그대로 열림)
  var ok={};document.querySelectorAll('details.det[open]').forEach(function(d){ok[d.dataset.k]=1});
  if(TAB==='overview')v.innerHTML=vOverview();else if(TAB==='pods')v.innerHTML=vPods();else if(TAB==='nodes')v.innerHTML=vNodes();
