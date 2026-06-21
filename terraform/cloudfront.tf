@@ -91,7 +91,7 @@ resource "aws_cloudfront_distribution" "this" {
     cached_methods         = ["GET", "HEAD"]
     compress               = true
 
-    cache_policy_id = data.aws_cloudfront_cache_policy.optimized.id
+    cache_policy_id = aws_cloudfront_cache_policy.images.id
 
     function_association {
       event_type   = "viewer-request"
@@ -117,6 +117,24 @@ data "aws_cloudfront_cache_policy" "disabled" {
 
 data "aws_cloudfront_cache_policy" "optimized" {
   name = "Managed-CachingOptimized"
+}
+
+# /images/* 전용: 쿼리스트링을 캐시 키에 포함 → ?v=1 / ?v=2 등 다른 쿼리는 다르게 캐싱.
+# (이미지가 새로 올라가며 쿼리스트링으로 캐시 무력화돼도 항상 최신을 가져옴)
+# 같은 URL+같은 쿼리는 여전히 캐시 히트(default_ttl 1일)라 성능도 유지.
+resource "aws_cloudfront_cache_policy" "images" {
+  name        = "${local.name}-images"
+  min_ttl     = 0
+  default_ttl = 86400
+  max_ttl     = 31536000
+
+  parameters_in_cache_key_and_forwarded_to_origin {
+    enable_accept_encoding_brotli = true
+    enable_accept_encoding_gzip   = true
+    cookies_config { cookie_behavior = "none" }
+    headers_config { header_behavior = "none" }
+    query_strings_config { query_string_behavior = "all" }
+  }
 }
 
 data "aws_cloudfront_origin_request_policy" "all_viewer" {

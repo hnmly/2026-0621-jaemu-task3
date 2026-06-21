@@ -15,9 +15,10 @@ resource "kubernetes_secret" "db" {
   data = {
     MYSQL_USER     = var.db_username
     MYSQL_PASSWORD = random_password.db.result
-    MYSQL_HOST     = aws_db_instance.this.address
-    MYSQL_PORT     = tostring(aws_db_instance.this.port)
-    MYSQL_DBNAME   = var.db_name
+    # 앱은 RDS 직접이 아니라 RDS Proxy 로 접속(커넥션 풀링 → 부하 시 커넥션 폭주 방지).
+    MYSQL_HOST   = aws_db_proxy.this.endpoint
+    MYSQL_PORT   = "3306"
+    MYSQL_DBNAME = var.db_name
   }
 }
 
@@ -29,17 +30,6 @@ resource "kubernetes_config_map" "s3" {
   data = {
     S3_BUCKET  = aws_s3_bucket.images.bucket
     AWS_REGION = var.region
-  }
-}
-
-# Seed dump for the user table (loaded by the db-init job below).
-resource "kubernetes_config_map" "user_seed" {
-  metadata {
-    name      = "user-seed"
-    namespace = kubernetes_namespace.app.metadata[0].name
-  }
-  data = {
-    "load_user.dump" = file("${path.module}/../load_user.dump")
   }
 }
 
@@ -57,7 +47,29 @@ resource "kubernetes_job" "db_init" {
         labels = { job = "db-init" }
       }
       spec {
-        restart_policy = "OnFailure"
+        restart_policy       = "OnFailure"
+        service_account_name = kubernetes_service_account.db_init.metadata[0].name
+
+        # S3 에서 시드 덤프를 받아 공유 볼륨(/seed)에 둔다. 크기 무제한(스트리밍).
+        init_container {
+          name    = "fetch-seed"
+          image   = "amazon/aws-cli:2.15.30"
+          command = ["sh", "-c"]
+          args    = ["aws s3 cp s3://${aws_s3_bucket.artifacts.bucket}/${aws_s3_object.seed.key} /seed/load_user.dump"]
+          env {
+            name  = "AWS_REGION"
+            value = var.region
+          }
+          env {
+            name  = "AWS_DEFAULT_REGION"
+            value = var.region
+          }
+          volume_mount {
+            name       = "seed"
+            mount_path = "/seed"
+          }
+        }
+
         container {
           name    = "mysql"
           image   = "mysql:8.0"
@@ -110,16 +122,14 @@ resource "kubernetes_job" "db_init" {
             secret_ref { name = kubernetes_secret.db.metadata[0].name }
           }
           volume_mount {
-            name       = "user-seed"
+            name       = "seed"
             mount_path = "/seed"
             read_only  = true
           }
         }
         volume {
-          name = "user-seed"
-          config_map {
-            name = kubernetes_config_map.user_seed.metadata[0].name
-          }
+          name = "seed"
+          empty_dir {}
         }
       }
     }
@@ -127,8 +137,8 @@ resource "kubernetes_job" "db_init" {
 
   wait_for_completion = true
   timeouts {
-    create = "10m"
+    create = "15m"
   }
 
-  depends_on = [aws_db_instance.this, aws_eks_node_group.main]
+  depends_on = [aws_db_instance.this, aws_db_proxy_target.this, aws_eks_node_group.main, aws_s3_object.seed]
 }
