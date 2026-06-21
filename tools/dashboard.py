@@ -194,7 +194,9 @@ function vCalc(){
 
 // ---- WAF분석 탭: waf_header_stats.py 출력 붙여넣기 → 막을 것 + 룰 + 테스트 ----
 var WAFX_VALID=['/v1/user','/v1/product','/v1/stress','/healthcheck','/images'];
-var WAFX_NORMHDR={'host':1,'accept-encoding':1,'content-type':1,'content-length':1,'accept':1,'user-agent':1,'connection':1,'via':1,'x-amz-cf-id':1,'upgrade-insecure-requests':1};
+var WAFX_NORMHDR={'host':1,'accept-encoding':1,'content-type':1,'content-length':1,'accept':1,'user-agent':1,'connection':1,'via':1,'x-amz-cf-id':1,'upgrade-insecure-requests':1,
+ 'accept-language':1,'accept-charset':1,'cache-control':1,'pragma':1,'dnt':1,'te':1,'priority':1,'cookie':1,'referer':1,'origin':1,'x-forwarded-for':1,'x-forwarded-proto':1,'x-forwarded-port':1,'true-client-ip':1,'cloudfront-forwarded-proto':1,
+ 'sec-ch-ua':1,'sec-ch-ua-mobile':1,'sec-ch-ua-platform':1,'sec-ch-ua-arch':1,'sec-ch-ua-bitness':1,'sec-ch-ua-model':1,'sec-ch-ua-full-version':1,'sec-ch-ua-full-version-list':1,'sec-ch-ua-platform-version':1,'sec-ch-ua-wow64':1,'sec-fetch-dest':1,'sec-fetch-mode':1,'sec-fetch-site':1,'sec-fetch-user':1};
 var WAFX_GOODUA=['hey/','go-http-client','curl/','mozilla','chrome','safari','firefox','edg'];
 var WAFX_SCAN=['sqlmap','nikto','nmap','masscan','acunetix','havij','wpscan','dirbuster','nuclei','attack','gobuster','fuzz','scanner','zgrab','python-requests'];
 function wafxValid(ep){ep=(ep||'').split('?')[0].toLowerCase();for(var i=0;i<WAFX_VALID.length;i++){if(ep===WAFX_VALID[i]||ep.indexOf(WAFX_VALID[i]+'/')===0||(WAFX_VALID[i]==='/images'&&ep.indexOf('/images')===0))return true;}return false;}
@@ -220,7 +222,9 @@ function wafxClassify(r){ // 반환: null(정상/404) 또는 {type, header, valu
     return null; // 모르는 UA는 섣불리 안 막음(오차단 방지)
   }
   if(hl==='x-forwarded-for'&&/(^|[ ,])(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(val))return {type:'XFF',header:'x-forwarded-for',value:val,why:'내부/루프백 IP 삽입'};
-  if(!WAFX_NORMHDR[hl])return {type:'HDR',header:hl,value:val,why:'처음 보는 헤더'}; // 화이트리스트 외 헤더
+  // 화이트리스트 외 헤더는, 값이 "쓰레기처럼 길거나(X-Junk류) 같은 문자 반복"일 때만 차단
+  // (sec-ch-ua 같은 짧은 정상 브라우저 헤더 오탐 방지)
+  if(!WAFX_NORMHDR[hl]&&(val.length>=24||/(.)\1{7,}/.test(val)))return {type:'HDR',header:hl,value:val,why:'비정상 헤더(과도/쓰레기 값)'};
   return null;
 }
 function wafxRule(f,prio){var nm,hcl;
