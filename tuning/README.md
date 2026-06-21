@@ -362,11 +362,32 @@ OK  BLOCK  6137  /v1/user  Host  d35...cloudfront.net
 ### 5. 대회 당일 — 새 공격 찾기 (패턴이 바뀐다)
 
 `판정` 컬럼은 **아는 패턴만** 잡는다(sqlmap, X-Junk…). 대회날은 *처음 보는* 공격이 와서 `OK`로
-보일 수 있다. 그래서 전체 표에서 **`ALLOW`인데 수상한 행**을 눈으로 찾는다:
-- **User-Agent**가 이상한 값 (빈 값, 모르는 도구 이름, `attack` 류)
-- **처음 보는 헤더** (`X-무엇무엇`), **비정상적으로 긴 값**
-- **X-Forwarded-For**에 `127.0.0.1`·`10.x`·`192.168.x` 같은 내부/가짜 IP
-- 같은 `/v1/user`인데 정상(hey/Go/json)과 **다른 특징**을 가진 것
+보일 수 있다. **"아직 안 막힌"이 비어 있어도 전체 표를 눈으로 봐야 한다.**
+
+#### 핵심: 정상을 외우고, 거기서 벗어나면 의심
+
+**정상 트래픽은 항상 이렇게 생겼다 (이걸 기준선으로):**
+- **User-Agent**: `hey/0.0.1`, `Go-http-client/1.1`, `curl/8.x`, (브라우저 `Mozilla/...`) — *요청 도구 이름*
+- **헤더 종류**: `Host`, `Accept-Encoding`, `Content-Type`, `Content-Length`, `Accept` — *HTTP 표준 헤더*
+- **값**: `...cloudfront.net`, `gzip`, `application/json`, 숫자 — *평범한 값*
+
+**행마다 3가지만 물어본다:**
+
+| 질문 | 정상 | 수상 (막을 후보) |
+|---|---|---|
+| ① 이 **헤더 이름**, 정상에도 있나? | Host / Accept-Encoding / Content-Type / Content-Length / Accept | **처음 보는 헤더** (`X-*`, `Referer` 등) |
+| ② **User-Agent**가 아는 도구인가? | hey / Go / curl / 브라우저 | **도구·스캐너 이름** (sqlmap, Nuclei, nikto…) |
+| ③ **값**이 뭔가 하려 하나? | cloudfront, gzip, 숫자 | **남의 도메인·경로·스크립트·쓰레기 문자** |
+
+→ 하나라도 "수상"이고 **경로가 유효(`/v1/user|product|stress`)** 면 → **403 막을 후보**.
+→ 단 **경로 자체가 없는 것**(`/wp-login.php`, `/.git/config`, `/admin`)이면 → 막는 게 아니라 **404**.
+
+**예시로 감 잡기**
+- `User-Agent: Nuclei …` → ②걸림(정상 UA 아닌 스캐너 이름) = **악성 UA**
+- `Referer: http://evil.net/…` → ①+③걸림(정상에 없는 헤더 + 남의 악성 도메인) = **헤더 값**
+- `X-Original-URL: /admin` → ①걸림(정상에 없는 헤더 + 값이 경로=우회 시도) = **비정상 헤더**
+- `X-Forwarded-For: 127.0.0.1, …` → ③걸림(내부/루프백 IP = 위조)
+- `/wp-login.php` → 경로가 없는 것 = **404** (막지 않음)
 
 ### 6. 막는 법 — 패턴 종류별 룰 (terraform/waf.tf 에 추가)
 
@@ -422,3 +443,112 @@ python3 waf_header_stats.py --log-group aws-waf-logs-wsi2026e --region us-east-1
 ```
 
 > 정상 트래픽이 같이 막히면 안 된다 → **대시보드 avail% 100% 유지** 확인하면서 조이기.
+
+---
+
+## 🎯 대회 당일 체크리스트 (감 없이 그대로 따라하기)
+
+> 헷갈리면 **여기만** 본다. 표의 **한 행씩** 아래 순서대로 기계적으로 처리.
+
+### STEP 0 — 돌리기
+```bash
+python3 waf_header_stats.py --log-group aws-waf-logs-<project> --region us-east-1 --hours 1
+```
+
+### STEP 1 — 행마다 **경로**부터 본다 (헤더 말고 경로 먼저!)
+
+`endpoint`가 아래 **유효 경로**인가?
+```
+/v1/user   /v1/product   /v1/stress   /healthcheck   /images/...
+```
+- **아니다** (예: `/.env` `/admin` `/wp-login.php` `/v1/users` `/v2/user` `/.git/config` `/backup.zip`)
+  → **그냥 둔다. 404가 정답.** (막는 거 아님. 이미 ALB가 404 처리)
+- **맞다** → STEP 2 로.
+
+### STEP 2 — 유효 경로면, **이 행이 정상 화이트리스트에 있나** 확인
+
+아래는 **정상**이다. 여기 있으면 그냥 둔다(통과가 정답):
+
+| 헤더 | 정상 값 |
+|---|---|
+| `User-Agent` | `hey/...`, `Go-http-client/...`, `curl/...`, `Mozilla/...`(브라우저) |
+| `Host` | 우리 cloudfront 도메인 |
+| `Accept-Encoding` | `gzip` 등 |
+| `Content-Type` | `application/json`, `multipart/form-data; ...`(이미지 업로드) |
+| `Content-Length` | 숫자 |
+| `Accept` | `*/*` 등 |
+
+→ **화이트리스트에 없으면 = 공격. STEP 3 으로.**
+
+### STEP 3 — 공격이면 **유형 찾아서 룰 복사** (아래 표에서 그대로)
+
+| 이렇게 생겼으면 | 유형 | waf.tf 에 추가할 룰 (priority 는 안 쓰는 번호로) |
+|---|---|---|
+| `User-Agent`가 **도구/스캐너 이름** (sqlmap, nuclei, nikto, nmap, masscan, dirbuster, wpscan, "attack" 등) | 악성 UA | 기존 `BadUserAgent` regex 에 단어만 추가: `"(sqlmap\|nikto\|nmap\|masscan\|attack\|nuclei\|<새단어>)"` |
+| **처음 보는 헤더**가 그냥 존재 (`X-Junk`, `X-Debug`, `X-Original-URL` …) | 비정상 헤더 | 아래 (A) 복사, `name = "<그 헤더 소문자>"` 만 변경 |
+| 헤더 **값**에 나쁜 게 들어감 (남의 도메인, 내부/메타데이터 IP `169.254.169.254`, SQL `' OR '1'='1`) | 헤더 값 | 아래 (B) 복사, `single_header { name }` 와 `search_string` 변경 |
+| `X-Forwarded-For`에 **내부/루프백 IP** (`127.0.0.1`, `10.x`, `192.168.x`, `172.16~31.x`) | XFF 위조 | 아래 (C) 로 교체 (현재 룰은 127.0.0.1만 잡음) |
+
+```hcl
+# (A) 특정 헤더가 "있기만 하면" 차단
+rule {
+  name = "BlockHeader_<X-Debug>"  priority = 6
+  action { block {} }
+  statement { size_constraint_statement {
+    comparison_operator = "GT"  size = 0
+    field_to_match { single_header { name = "x-debug" } }   # ← 소문자
+    text_transformation { priority = 0  type = "NONE" }
+  }}
+  visibility_config { cloudwatch_metrics_enabled = true  metric_name = "x-debug"  sampled_requests_enabled = true }
+}
+
+# (B) 특정 헤더 "값"에 문자열이 들어가면 차단
+rule {
+  name = "BlockValue_<Referer>"  priority = 7
+  action { block {} }
+  statement { byte_match_statement {
+    search_string = "169.254.169.254"  positional_constraint = "CONTAINS"   # ← 막을 문자열
+    field_to_match { single_header { name = "referer" } }                    # ← 헤더
+    text_transformation { priority = 0  type = "LOWERCASE" }
+  }}
+  visibility_config { cloudwatch_metrics_enabled = true  metric_name = "bad-referer"  sampled_requests_enabled = true }
+}
+
+# (C) X-Forwarded-For 위조 (내부/사설 IP) — 기존 SpoofedForwardedFor 의 byte_match 를 이 regex_match 로 교체
+#     statement { regex_match_statement {
+#       regex_string = "(127\.0\.0\.1|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)"
+#       field_to_match { single_header { name = "x-forwarded-for" } }
+#       text_transformation { priority = 0  type = "NONE" }
+#     }}
+```
+
+### STEP 4 — 적용 & 재확인
+```powershell
+cd C:\Users\competitor\2026-terraform\3과제\terraform
+terraform apply -auto-approve -var is_windows=true
+```
+```bash
+# 그 공격 흉내로 호출 → 403 떠야 함
+curl -s -o /dev/null -w "%{http_code}\n" -H "X-Debug: 1" "http://<ep>/v1/user?email=x@x.org&requestid=1&uuid=1"   # 403
+# 없는 경로는 여전히 404 인지
+curl -s -o /dev/null -w "%{http_code}\n" "http://<ep>/.env"   # 404
+# 다시 통계 (공격이 BLOCK 으로 바뀌었는지)
+python3 waf_header_stats.py --log-group aws-waf-logs-<project> --region us-east-1 --hours 1
+```
+- 마지막에 **대시보드 avail% 100%** 확인 (정상 오차단 없는지).
+
+### ⚠ 자주 틀리는 함정 3개 (이것만 외우기)
+1. **헤더가 정상이어도 경로가 없으면 → 404** (막는 거 아님). 경로부터 봐라.
+2. **값이 IP/URL이면 "무슨" 주소인지 봐라.** `169.254.169.254`(AWS 키 탈취)·내부IP·남의 도메인 = 공격.
+3. **낯선 UA ≠ 공격.** `Mozilla/...`(브라우저)는 정상. **도구·스캐너 이름**만 막는다.
+
+### 한 장 요약 (흐름)
+```
+행 →  경로가 유효?  ─아니오→  404 (그냥 둠)
+            │ 예
+            ▼
+      정상 헤더/값?  ─예→  통과 (그냥 둠)
+            │ 아니오
+            ▼
+      유형 찾아 룰 복사 (UA / 헤더존재 / 헤더값 / XFF) → apply → 재확인
+```
